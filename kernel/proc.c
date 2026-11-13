@@ -5,6 +5,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "pinfo.h"
+
+extern uint ticks;
 
 struct cpu cpus[NCPU];
 
@@ -25,6 +28,11 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+static const int mlfq_slice[NLEVEL] = { 1, 2, 4, 8 };
+
+static int mlfq_cursor[NLEVEL];
+static struct spinlock mlfq_lock;
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -51,6 +59,9 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&mlfq_lock, "mlfq");
+  for (int l = 0; l < NLEVEL; l++)
+    mlfq_cursor[l] = NPROC - 1;
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -124,6 +135,12 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+
+  p->level = 0;
+  p->used = 0;
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = ticks;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -442,25 +459,40 @@ scheduler(void)
     intr_off();
 
     int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    for (int level = 0; level < NLEVEL && !found; level++) {
+      acquire(&mlfq_lock);
+      int start = mlfq_cursor[level];
+      release(&mlfq_lock);
 
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
+      for (int i = 1; i <= NPROC; i++) {
+        int slot = (start + i) % NPROC;
+        p = &proc[slot];
+        acquire(&p->lock);
+        if (p->state == RUNNABLE && p->level == level) {
+          acquire(&mlfq_lock);
+          mlfq_cursor[level] = slot;
+          release(&mlfq_lock);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+          // Switch to chosen process.  It is the process's job
+          // to release its lock and then reacquire it
+          // before jumping back to us.
+          p->nsched++;
+          p->state = RUNNING;
+          c->proc = p;
+          swtch(&c->context, &p->context);
+
+          // Don't re-enable interrupts on release.
+          mycpu()->intena = 0;
+
+          // Process is done running for now.
+          // It should have changed its p->state before coming back.
+          c->proc = 0;
+          found = 1;
+        }
+        release(&p->lock);
+        if (found)
+          break;
       }
-      release(&p->lock);
     }
     if (found == 0) {
       // nothing to run; stop running on this core until an interrupt.
@@ -505,6 +537,85 @@ yield(void)
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
+}
+
+int
+mlfq_tick(struct proc *p)
+{
+  struct proc *q;
+  int level;
+
+  acquire(&p->lock);
+  p->runticks++;
+  p->used++;
+  if (p->used >= mlfq_slice[p->level]) {
+    if (p->level < NLEVEL - 1)
+      p->level++;
+    p->used = 0;
+    release(&p->lock);
+    return 1;
+  }
+  level = p->level;
+  release(&p->lock);
+
+  for (q = proc; q < &proc[NPROC]; q++) {
+    if (q == p)
+      continue;
+    acquire(&q->lock);
+    int higher = (q->state == RUNNABLE && q->level < level);
+    release(&q->lock);
+    if (higher)
+      return 1;
+  }
+  return 0;
+}
+
+void
+mlfq_boost(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    p->level = 0;
+    p->used = 0;
+    release(&p->lock);
+  }
+}
+
+int
+getpinfo(uint64 addr, int max)
+{
+  struct proc *p;
+  struct proc *me = myproc();
+  struct pinfo pi;
+  int n = 0;
+
+  if (max < 0)
+    return -1;
+
+  for (p = proc; p < &proc[NPROC] && n < max; p++) {
+    acquire(&p->lock);
+    if (p->state == UNUSED) {
+      release(&p->lock);
+      continue;
+    }
+    memset(&pi, 0, sizeof(pi));
+    pi.pid = p->pid;
+    pi.state = p->state;
+    pi.level = p->level;
+    pi.runticks = p->runticks;
+    pi.nsched = p->nsched;
+    pi.ctime = p->ctime;
+    safestrcpy(pi.name, p->name, sizeof(pi.name));
+    release(&p->lock);
+
+    if (copyout(me->pagetable, me->sz, addr + (uint64)n * sizeof(pi),
+                (char *)&pi, sizeof(pi)) < 0)
+      return -1;
+    n++;
+  }
+  return n;
 }
 
 // A fork child's very first scheduling by scheduler()
